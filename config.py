@@ -1,6 +1,7 @@
 import torch
 class Config:
-    kitti_root = "data/thesis kitti data"
+    kitti_raw_root = "data/kitti_raw"
+    kitti_root = "data/kitti_unified"
     sequence = "00"
     max_frames = 500
     imu_rate = 100.0
@@ -52,3 +53,8 @@ class Config:
     init_bias_acc_std = 0.01
     init_bias_gyro_std = 0.001
     bev_dim = None
+kitti_raw_root = "data/kitti_raw"
+kitti_raw_root = "data/kitti_raw"
+kitti_raw_root = "data/kitti_raw"
+kitti_raw_root = "data/kitti_raw"
+kitti_root = "data/kitti_unified"
