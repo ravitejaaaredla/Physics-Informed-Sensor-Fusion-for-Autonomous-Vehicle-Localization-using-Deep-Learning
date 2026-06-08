@@ -37,7 +37,7 @@ class Config:
     lambda_physics = 0.5
     lambda_smooth = 0.01
     adaptive_loss_weights = True
-    model_type = "pinn"
+    model_type = "pure_dl"
     accel_bias_std = 3e-3 * 9.81
     gyro_bias_std = 10 * (3.14159/180) / 3600
     accel_bias_walk = 1e-4 / (100**0.5)
