@@ -1,204 +1,189 @@
-import torch
-import numpy as np
-from pathlib import Path
-from torch.utils.data import DataLoader, Dataset
-from config import Config
-from src.models import FusionModel
-from src.physics_loss import PhysicsLoss
-from src.eval.metrics import ATE, RPE
+# train_physics_loss.py
+
 import os
-from PIL import Image
+import random
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-# -------------------------------------------------------------------
-# Data loader for windows (real KITTI raw sequence)
-# -------------------------------------------------------------------
-def load_raw_sequence(config, seq_dir):
-    root = Path(seq_dir)
-    poses_file = root / "poses.txt"
-    if not poses_file.exists():
-        raise FileNotFoundError(f"Poses file not found: {poses_file}")
+from config import Config
+from src.models import FusionModel
+from src.raw_kitti_utils import load_raw_sequence, DeltaWindowDataset
 
-    poses = np.loadtxt(poses_file).reshape(-1, 3, 4)
-    num_frames = min(config.max_frames, len(poses))
-    poses = poses[:num_frames]
 
-    # Targets: [x, y, v, yaw]
-    targets = []
-    for i in range(num_frames):
-        p = poses[i, :3, 3]
-        Rmat = poses[i, :3, :3]
-        yaw = np.arctan2(Rmat[1,0], Rmat[0,0])
-        if i == 0:
-            v = 0.0
-        else:
-            dt = 0.1
-            dp = p - poses[i-1, :3, 3]
-            v = np.linalg.norm(dp) / dt
-        targets.append([p[0], p[1], v, yaw])
-    targets = np.array(targets)
+def seed_everything(seed: int = 42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
 
-    # Normalise positions (zero‑mean, unit‑variance)
-    pos_mean = np.mean(targets[:,:2], axis=0)
-    pos_std = np.std(targets[:,:2], axis=0) + 1e-8
-    targets[:,:2] = (targets[:,:2] - pos_mean) / pos_std
 
-    # LiDAR
-    velo_dir = root / "velodyne_points" / "data"
-    lidar_pts = []
-    for i in range(num_frames):
-        bin_file = velo_dir / f"{i:010d}.bin"
-        if bin_file.exists():
-            pts = np.fromfile(bin_file, dtype=np.float32).reshape(-1, 4)[:,:3]
-            idx = np.random.choice(len(pts), min(1024, len(pts)), replace=False)
-            pts = pts[idx]
-            lidar_pts.append(pts.astype(np.float32))
-        else:
-            lidar_pts.append(np.random.randn(1024,3).astype(np.float32))
+def wrap_angle_torch(angle):
+    return torch.atan2(torch.sin(angle), torch.cos(angle))
 
-    # Camera
-    img_dir = root / "image_02" / "data"
-    cam_imgs = []
-    for i in range(num_frames):
-        img_file = img_dir / f"{i:010d}.png"
-        if img_file.exists():
-            img = Image.open(img_file).resize((config.camera_img_w, config.camera_img_h))
-            img = np.array(img, dtype=np.float32) / 255.0
-            cam_imgs.append(img)
-        else:
-            cam_imgs.append(np.zeros((config.camera_img_h, config.camera_img_w, 3), dtype=np.float32))
 
-    # Real IMU from oxts
-    oxts_dir = root / "oxts" / "data"
-    imu_data = []
-    for i in range(num_frames):
-        oxts_file = oxts_dir / f"{i:010d}.txt"
-        if oxts_file.exists():
-            oxts = np.loadtxt(oxts_file)
-            imu = oxts[11:14].tolist() + oxts[17:20].tolist()
-            imu_data.append(imu)
-        else:
-            imu_data.append([0,0,0,0,0,0])
-    imu_data = np.array(imu_data, dtype=np.float32)
+class PhysicsDeltaLoss(torch.nn.Module):
+    """
+    Model output:
+        pred_delta = [dx_body, dy_body, dv, dyaw]
 
-    return targets, lidar_pts, cam_imgs, imu_data, pos_mean, pos_std
+    Physics constraints:
+        1. dv should agree with forward acceleration.
+        2. dyaw should agree with gyro z.
+        3. displacement should agree with v*dt + 0.5*a*dt^2.
+        4. lateral displacement should be small.
+    """
 
-class WindowDataset(Dataset):
-    def __init__(self, targets, lidar_pts, cam_imgs, imu_data, window_size=10, stride=5):
-        self.window_size = window_size
-        self.stride = stride
-        self.targets = targets
-        self.lidar_pts = lidar_pts
-        self.cam_imgs = cam_imgs
-        self.imu_data = imu_data
-        self.indices = list(range(0, len(targets) - window_size + 1, stride))
+    def __init__(self, config):
+        super().__init__()
 
-    def __len__(self):
-        return len(self.indices)
+        self.dt = config.dt
+        self.lambda_data = config.lambda_data
+        self.lambda_physics = config.lambda_physics
+        self.lambda_smooth = config.lambda_smooth
 
-    def __getitem__(self, idx):
-        start = self.indices[idx]
-        end = start + self.window_size
-        # targets: (win, 4)
-        target_win = self.targets[start:end]
-        # IMU: (win, 6)
-        imu_win = self.imu_data[start:end]
-        # LiDAR: list of (1024,3) for each frame
-        lidar_win = self.lidar_pts[start:end]
-        # Camera: list of (H,W,3) for each frame
-        cam_win = self.cam_imgs[start:end]
-        return (torch.tensor(imu_win, dtype=torch.float32),
-                torch.stack([torch.tensor(p, dtype=torch.float32) for p in lidar_win]),
-                torch.stack([torch.tensor(c, dtype=torch.float32).permute(2,0,1) for c in cam_win]),
-                torch.tensor(target_win, dtype=torch.float32))
+    def forward(self, pred_delta, target_delta, imu_win, prev_state):
+        data_loss = F.smooth_l1_loss(pred_delta, target_delta)
 
-# -------------------------------------------------------------------
-# Training loop with physics loss
-# -------------------------------------------------------------------
+        acc_x = imu_win[:, -1, 0]
+        gyro_z = imu_win[:, -1, 5]
+        v_prev = prev_state[:, 2]
+
+        dx_b = pred_delta[:, 0]
+        dy_b = pred_delta[:, 1]
+        dv = pred_delta[:, 2]
+        dyaw = pred_delta[:, 3]
+
+        expected_dv = acc_x * self.dt
+        expected_dyaw = gyro_z * self.dt
+
+        expected_distance = torch.clamp(
+            v_prev * self.dt + 0.5 * acc_x * (self.dt ** 2),
+            min=0.0,
+        )
+
+        pred_distance = torch.sqrt(dx_b ** 2 + dy_b ** 2 + 1e-8)
+
+        loss_dv = F.smooth_l1_loss(dv, expected_dv)
+        loss_dyaw = F.smooth_l1_loss(
+            wrap_angle_torch(dyaw),
+            wrap_angle_torch(expected_dyaw),
+        )
+        loss_distance = F.smooth_l1_loss(pred_distance, expected_distance)
+
+        # Non-holonomic vehicle constraint
+        loss_lateral = torch.mean(torch.abs(dy_b))
+
+        physics_loss = (
+            loss_dv
+            + loss_dyaw
+            + loss_distance
+            + 0.1 * loss_lateral
+        )
+
+        smooth_loss = torch.mean(pred_delta ** 2)
+
+        total = (
+            self.lambda_data * data_loss
+            + self.lambda_physics * physics_loss
+            + self.lambda_smooth * smooth_loss
+        )
+
+        return total, data_loss.detach(), physics_loss.detach(), smooth_loss.detach()
+
+
 def main():
     config = Config()
+    seed_everything(config.seed)
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
 
-    seq_dir = "data/Kitti_raw/2011_09_26-3/2011_09_26_drive_0009_sync"
-    print(f"Loading raw sequence from {seq_dir}...")
-    targets, lidar_pts, cam_imgs, imu_data, pos_mean, pos_std = load_raw_sequence(config, seq_dir)
+    states, lidar_pts, cam_imgs, imu_data = load_raw_sequence(config.seq_dir, config)
 
-    dataset = WindowDataset(targets, lidar_pts, cam_imgs, imu_data,
-                            window_size=10, stride=5)
-    loader = DataLoader(dataset, batch_size=config.batch_size, shuffle=True)
+    dataset = DeltaWindowDataset(
+        states=states,
+        lidar_pts=lidar_pts,
+        cam_imgs=cam_imgs,
+        imu_data=imu_data,
+        config=config,
+    )
+
+    loader = DataLoader(
+        dataset,
+        batch_size=config.batch_size,
+        shuffle=True,
+        num_workers=0,
+        drop_last=False,
+    )
+
+    print(f"Training samples: {len(dataset)}")
 
     model = FusionModel(config).to(device)
-    physics_loss_fn = PhysicsLoss(config)
-    optimizer = torch.optim.Adam(model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
 
-    print("Training with real IMU, LiDAR, camera and physics‑informed loss (windowed)...")
+    loss_fn = PhysicsDeltaLoss(config)
+
+    optimizer = torch.optim.Adam(
+        model.parameters(),
+        lr=config.learning_rate,
+        weight_decay=config.weight_decay,
+    )
+
+    print("Training PINN delta model...")
+    print("Output target = [dx_body, dy_body, dv, dyaw]")
+
     for epoch in range(config.num_epochs):
+        model.train()
+
         total_loss = 0.0
-        for imu_win, lidar_win, cam_win, target_win in tqdm(loader, desc=f"Epoch {epoch+1}"):
-            # imu_win: (batch, win, 6)
-            # lidar_win: (batch, win, 1024, 3)
-            # cam_win: (batch, win, 3, 128, 416)
-            # target_win: (batch, win, 4)
+        total_data = 0.0
+        total_phys = 0.0
+        total_smooth = 0.0
+
+        for imu_win, lidar, cam, prev_state, delta_target in tqdm(
+            loader,
+            desc=f"Epoch {epoch + 1}/{config.num_epochs}",
+        ):
             imu_win = imu_win.to(device)
-            lidar_win = lidar_win.to(device)
-            cam_win = cam_win.to(device)
-            target_win = target_win.to(device)
+            lidar = lidar.to(device)
+            cam = cam.to(device)
+            prev_state = prev_state.to(device)
+            delta_target = delta_target.to(device)
 
-            batch_size, win = imu_win.shape[:2]
+            pred_delta = model(imu_win, lidar, cam)
 
-            # Model expects (batch, seq_len, 6) for IMU, (batch, N, 3) for LiDAR, (batch, 3, H, W) for camera
-            # But our model currently works only on single timestep. To use the existing model, we will iterate over timesteps.
-            # We'll predict each timestep separately and stack the predictions.
-            preds = []
-            for t in range(win):
-                imu_t = imu_win[:, t, :].unsqueeze(1)   # (batch, 1, 6)
-                lidar_t = lidar_win[:, t, :, :]         # (batch, 1024, 3)
-                cam_t = cam_win[:, t, :, :, :]          # (batch, 3, 128, 416)
-                pred_t = model(imu_t, lidar_t, cam_t)   # (batch, 4)
-                preds.append(pred_t.unsqueeze(1))
-            pred_win = torch.cat(preds, dim=1)           # (batch, win, 4)
+            loss, data_loss, phys_loss, smooth_loss = loss_fn(
+                pred_delta,
+                delta_target,
+                imu_win,
+                prev_state,
+            )
 
-            # Compute data loss
-            data_loss = torch.nn.MSELoss()(pred_win, target_win)
-
-            # Compute physics loss (needs windowed predictions and IMU accelerations/gyro)
-            # For simplicity, we use the same IMU data used as input (the first 6 columns are acc+gyro)
-            imu_acc_body = imu_win[:, :, :3]    # (batch, win, 3)  accelerations
-            imu_gyro_z = imu_win[:, :, 5]       # (batch, win)      yaw rate (gyro z)
-
-            # PhysicsLoss expects (pred, target, imu_acc_body, imu_gyro_z)
-            # Our PhysicsLoss.forward is designed for (B,T,4) etc. It will compute residuals over the window.
-            phys_loss = physics_loss_fn(pred_win, target_win, imu_acc_body, imu_gyro_z)
-
-            total = data_loss + phys_loss   # Adaptive weighting inside PhysicsLoss already handles lambdas
             optimizer.zero_grad()
-            total.backward()
+            loss.backward()
             optimizer.step()
-            total_loss += total.item()
 
-        print(f"Epoch {epoch+1}/{config.num_epochs} Avg Loss: {total_loss/len(loader):.6f}")
+            total_loss += loss.item()
+            total_data += data_loss.item()
+            total_phys += phys_loss.item()
+            total_smooth += smooth_loss.item()
+
+        n = max(1, len(loader))
+
+        print(
+            f"Epoch {epoch + 1}/{config.num_epochs} | "
+            f"Total: {total_loss / n:.6f} | "
+            f"Data: {total_data / n:.6f} | "
+            f"Physics: {total_phys / n:.6f} | "
+            f"Smooth: {total_smooth / n:.6f}"
+        )
 
     os.makedirs("models", exist_ok=True)
-    torch.save(model.state_dict(), "models/pinn_physics.pth")
-    print("Model saved as models/pinn_physics.pth")
+    torch.save(model.state_dict(), "models/pinn_delta_physics.pth")
+    print("Saved model to models/pinn_delta_physics.pth")
 
-    # Final evaluation on full sequence (non‑windowed, but normalised)
-    # We'll evaluate frame‑by‑frame using the trained model.
-    model.eval()
-    imu_full = torch.tensor(imu_data, dtype=torch.float32).unsqueeze(1).to(device)
-    lidar_full = torch.stack([torch.tensor(p, dtype=torch.float32) for p in lidar_pts]).to(device)
-    cam_full = torch.stack([torch.tensor(c, dtype=torch.float32).permute(2,0,1) for c in cam_imgs]).to(device)
-    target_full = torch.tensor(targets, dtype=torch.float32).to(device)
-
-    with torch.no_grad():
-        pred_full = model(imu_full, lidar_full, cam_full).cpu().numpy()
-    # Denormalise positions
-    pred_full[:,:2] = pred_full[:,:2] * pos_std + pos_mean
-    targets_denorm = targets.copy()
-    targets_denorm[:,:2] = targets_denorm[:,:2] * pos_std + pos_mean
-    ate = ATE(pred_full[:,:2], targets_denorm[:,:2])
-    rpe = RPE(pred_full[:,:2], targets_denorm[:,:2])
-    print(f"Evaluation on full sequence (denormalised): ATE = {ate:.3f} m, RPE = {rpe:.3f} m")
 
 if __name__ == "__main__":
     main()

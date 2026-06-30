@@ -1,116 +1,235 @@
+# plot_trajectory_final.py
+
+import os
+
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
-from pathlib import Path
-from PIL import Image
+
 from config import Config
 from src.models import FusionModel
+from src.raw_kitti_utils import load_raw_sequence
 
-def load_raw_sequence(seq_dir, config):
-    root = Path(seq_dir)
-    poses_file = root / "poses.txt"
-    poses = np.loadtxt(poses_file).reshape(-1, 3, 4)
-    num_frames = min(config.max_frames, len(poses))
-    poses = poses[:num_frames]
-    targets = []
-    for i in range(num_frames):
-        p = poses[i, :3, 3]
-        Rmat = poses[i, :3, :3]
-        yaw = np.arctan2(Rmat[1,0], Rmat[0,0])
-        if i == 0:
-            v = 0.0
-        else:
-            dt = 0.1
-            dp = p - poses[i-1, :3, 3]
-            v = np.linalg.norm(dp) / dt
-        targets.append([p[0], p[1], v, yaw])
-    targets = np.array(targets)
-    pos_mean = np.mean(targets[:,:2], axis=0)
-    pos_std = np.std(targets[:,:2], axis=0) + 1e-8
-    targets_norm = targets.copy()
-    targets_norm[:,:2] = (targets[:,:2] - pos_mean) / pos_std
-    return targets_norm, targets, pos_mean, pos_std
 
-def load_sensor_data(seq_dir, num_frames, config):
-    root = Path(seq_dir)
-    lidar_pts = []
-    for i in range(num_frames):
-        bin_file = root / "velodyne_points" / "data" / f"{i:010d}.bin"
-        if bin_file.exists():
-            pts = np.fromfile(bin_file, dtype=np.float32).reshape(-1, 4)[:,:3]
-            idx = np.random.choice(len(pts), min(1024, len(pts)), replace=False)
-            pts = pts[idx]
-            lidar_pts.append(pts.astype(np.float32))
-        else:
-            lidar_pts.append(np.random.randn(1024,3).astype(np.float32))
-    cam_imgs = []
-    for i in range(num_frames):
-        img_file = root / "image_02" / "data" / f"{i:010d}.png"
-        if img_file.exists():
-            img = Image.open(img_file).resize((config.camera_img_w, config.camera_img_h))
-            img = np.array(img, dtype=np.float32) / 255.0
-            cam_imgs.append(img)
-        else:
-            cam_imgs.append(np.zeros((config.camera_img_h, config.camera_img_w, 3), dtype=np.float32))
-    oxts_dir = root / "oxts" / "data"
-    imu_data = []
-    for i in range(num_frames):
-        oxts_file = oxts_dir / f"{i:010d}.txt"
-        if oxts_file.exists():
-            oxts = np.loadtxt(oxts_file)
-            imu = oxts[11:14].tolist() + oxts[17:20].tolist()
-            imu_data.append(imu)
-        else:
-            imu_data.append([0,0,0,0,0,0])
-    imu_data = np.array(imu_data, dtype=np.float32)
-    return lidar_pts, cam_imgs, imu_data
+def wrap_angle(angle):
+    return (angle + np.pi) % (2 * np.pi) - np.pi
+
+
+def ate(pred_xy, gt_xy):
+    n = min(len(pred_xy), len(gt_xy))
+    pred_xy = pred_xy[:n]
+    gt_xy = gt_xy[:n]
+    return float(np.sqrt(np.mean(np.sum((pred_xy - gt_xy) ** 2, axis=1))))
+
+
+def rpe(pred_xy, gt_xy):
+    n = min(len(pred_xy), len(gt_xy))
+    pred_xy = pred_xy[:n]
+    gt_xy = gt_xy[:n]
+
+    if n < 2:
+        return float("nan")
+
+    pred_rel = pred_xy[1:] - pred_xy[:-1]
+    gt_rel = gt_xy[1:] - gt_xy[:-1]
+    return float(np.sqrt(np.mean(np.sum((pred_rel - gt_rel) ** 2, axis=1))))
+
+
+def integrate_delta_model(model, states, lidar_pts, cam_imgs, imu_data, config, device):
+    model.eval()
+
+    pred_states = []
+
+    x, y, v, yaw = states[0]
+    pred_states.append([x, y, v, yaw])
+
+    for end in range(config.window_size - 1, len(states) - 1):
+        start = end - config.window_size + 1
+
+        imu_win = imu_data[start:end + 1]
+        lidar = lidar_pts[end]
+        cam = cam_imgs[end]
+
+        imu_t = torch.tensor(imu_win, dtype=torch.float32).unsqueeze(0).to(device)
+        lidar_t = torch.tensor(lidar, dtype=torch.float32).unsqueeze(0).to(device)
+        cam_t = (
+            torch.tensor(cam, dtype=torch.float32)
+            .permute(2, 0, 1)
+            .unsqueeze(0)
+            .to(device)
+        )
+
+        with torch.no_grad():
+            delta = model(imu_t, lidar_t, cam_t).cpu().numpy()[0]
+
+        # --------------------------------------------------
+        # DEBUG ONLY: Ground-truth scale calibration
+        # This checks whether the model's main problem is
+        # wrong step size or wrong movement direction.
+        #
+        # Do NOT report this as final fair thesis result.
+        # --------------------------------------------------
+        gt_step = states[end + 1, :2] - states[end, :2]
+        gt_dist = np.linalg.norm(gt_step)
+
+        pred_dist = np.linalg.norm(delta[:2]) + 1e-8
+
+        scale = gt_dist / pred_dist
+        scale = np.clip(scale, 0.2, 5.0)
+
+        delta[0] *= scale
+        delta[1] *= scale
+
+        dx_b, dy_b, dv, dyaw = delta
+
+        c = np.cos(yaw)
+        s = np.sin(yaw)
+
+        dx_w = c * dx_b - s * dy_b
+        dy_w = s * dx_b + c * dy_b
+
+        x = x + dx_w
+        y = y + dy_w
+        v = max(0.0, v + dv)
+        # DEBUG ONLY:
+        # Use ground-truth yaw to test whether predicted dyaw causes drift.
+        gyro_z = imu_win[-1, 5]
+        yaw = wrap_angle(yaw + gyro_z * config.dt)
+
+        pred_states.append([x, y, v, yaw])
+
+    return np.asarray(pred_states, dtype=np.float32)
+
+
+def plot_all(gt_xy, pred_xy, save_prefix):
+    os.makedirs("results", exist_ok=True)
+
+    n = min(len(gt_xy), len(pred_xy))
+    gt_xy = gt_xy[:n]
+    pred_xy = pred_xy[:n]
+
+    error = np.linalg.norm(pred_xy - gt_xy, axis=1)
+
+    print(f"ATE: {ate(pred_xy, gt_xy):.3f} m")
+    print(f"RPE: {rpe(pred_xy, gt_xy):.3f} m")
+    print(f"Mean error: {np.mean(error):.3f} m")
+    print(f"Median error: {np.median(error):.3f} m")
+    print(f"Max error: {np.max(error):.3f} m")
+    print(f"95th percentile error: {np.percentile(error, 95):.3f} m")
+
+    plt.figure(figsize=(8, 6))
+    plt.plot(gt_xy[:, 0], gt_xy[:, 1], "k-", linewidth=2.5, label="Ground Truth")
+    plt.plot(
+        pred_xy[:, 0],
+        pred_xy[:, 1],
+        linewidth=2.0,
+        label="PINN Delta Physics + GT Scale Debug",
+    )
+    plt.xlabel("X (m)")
+    plt.ylabel("Y (m)")
+    plt.title("Trajectory Comparison - Scale Debug")
+    plt.axis("equal")
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(f"results/{save_prefix}_trajectory_scale_debug.png", dpi=200)
+    plt.show()
+
+    start = min(50, n - 2)
+    end = min(150, n)
+
+    plt.figure(figsize=(8, 6))
+    plt.plot(
+        gt_xy[start:end, 0],
+        gt_xy[start:end, 1],
+        "k-",
+        linewidth=2.5,
+        label="Ground Truth",
+    )
+    plt.plot(
+        pred_xy[start:end, 0],
+        pred_xy[start:end, 1],
+        linewidth=2.0,
+        label="PINN Delta Physics + GT Scale Debug",
+    )
+    plt.xlabel("X (m)")
+    plt.ylabel("Y (m)")
+    plt.title(f"Zoomed Trajectory Frames {start}-{end} - Scale Debug")
+    plt.axis("equal")
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(f"results/{save_prefix}_trajectory_zoom_scale_debug.png", dpi=200)
+    plt.show()
+
+    plt.figure(figsize=(9, 4))
+    plt.plot(np.arange(n), error, linewidth=1.5)
+    plt.xlabel("Frame")
+    plt.ylabel("Position Error (m)")
+    plt.title("Position Error over Time - Scale Debug")
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(f"results/{save_prefix}_error_over_time_scale_debug.png", dpi=200)
+    plt.show()
+
+    plt.figure(figsize=(7, 4))
+    plt.hist(error, bins=30, alpha=0.8)
+    plt.xlabel("Position Error (m)")
+    plt.ylabel("Count")
+    plt.title("Error Distribution - Scale Debug")
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(f"results/{save_prefix}_error_histogram_scale_debug.png", dpi=200)
+    plt.show()
+
+    sorted_error = np.sort(error)
+    cdf = np.arange(1, len(sorted_error) + 1) / len(sorted_error)
+
+    plt.figure(figsize=(7, 4))
+    plt.plot(sorted_error, cdf, linewidth=2)
+    plt.xlabel("Position Error (m)")
+    plt.ylabel("CDF")
+    plt.title("Cumulative Error Distribution - Scale Debug")
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(f"results/{save_prefix}_error_cdf_scale_debug.png", dpi=200)
+    plt.show()
+
 
 def main():
     config = Config()
-    seq_dir = "data/Kitti_raw/2011_09_26-3/2011_09_26_drive_0009_sync"
-    device = torch.device("cpu")
-    targets_norm, targets_orig, pos_mean, pos_std = load_raw_sequence(seq_dir, config)
-    num_frames = len(targets_norm)
-    lidar_pts, cam_imgs, imu_data = load_sensor_data(seq_dir, num_frames, config)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    states, lidar_pts, cam_imgs, imu_data = load_raw_sequence(config.seq_dir, config)
+
+    model_path = "models/pinn_delta_physics.pth"
+    if not os.path.exists(model_path):
+        raise FileNotFoundError(
+            f"{model_path} not found. Run this first: python train_physics_loss.py"
+        )
 
     model = FusionModel(config).to(device)
-    model.load_state_dict(torch.load("models/pinn_singleframe.pth", map_location=device))
+    model.load_state_dict(torch.load(model_path, map_location=device))
     model.eval()
 
-    imu_t = torch.tensor(imu_data, dtype=torch.float32).unsqueeze(1)
-    lidar_t = torch.stack([torch.tensor(p, dtype=torch.float32) for p in lidar_pts])
-    cam_t = torch.stack([torch.tensor(c, dtype=torch.float32).permute(2,0,1) for c in cam_imgs])
-    with torch.no_grad():
-        pred_norm = model(imu_t, lidar_t, cam_t).numpy()
-    pred_phys = pred_norm.copy()
-    pred_phys[:,:2] = pred_norm[:,:2] * pos_std + pos_mean
+    pred_states = integrate_delta_model(
+        model=model,
+        states=states,
+        lidar_pts=lidar_pts,
+        cam_imgs=cam_imgs,
+        imu_data=imu_data,
+        config=config,
+        device=device,
+    )
 
-    # Create figure with inset
-    fig, ax = plt.subplots(figsize=(8,6))
-    ax.plot(targets_orig[:500,0], targets_orig[:500,1], 'k-', linewidth=1.5, label='Ground Truth')
-    ax.plot(pred_phys[:500,0], pred_phys[:500,1], 'g--', linewidth=1.5, label='PINN (single‑frame)')
-    ax.set_xlabel("X (m)")
-    ax.set_ylabel("Y (m)")
-    ax.set_title("Trajectory Comparison (KITTI raw sequence 0009)")
-    ax.legend()
-    ax.axis('equal')
+    gt_xy = states[: len(pred_states), :2]
+    pred_xy = pred_states[:, :2]
 
-    # Inset zoom (e.g., frames 200-250)
-    from mpl_toolkits.axes_grid1.inset_locator import inset_axes, mark_inset
-    axins = inset_axes(ax, width="35%", height="35%", loc='lower right',
-                       bbox_to_anchor=(0.1, 0.1, 0.8, 0.8), bbox_transform=ax.transAxes)
-    start, end = 200, 250
-    axins.plot(targets_orig[start:end,0], targets_orig[start:end,1], 'k-', linewidth=1.5)
-    axins.plot(pred_phys[start:end,0], pred_phys[start:end,1], 'g--', linewidth=1.5)
-    axins.set_title(f"Zoom (frames {start}-{end})")
-    axins.axis('equal')
-    # Mark the zoom area on the main plot
-    mark_inset(ax, axins, loc1=1, loc2=2, fc="none", ec="gray", linewidth=1)
+    np.save("results/pinn_delta_pred_xy_scale_debug.npy", pred_xy)
+    np.save("results/gt_xy_scale_debug.npy", gt_xy)
 
-    plt.tight_layout()
-    plt.savefig("results/trajectory_clean.png", dpi=150)
-    plt.show()
-    print("Clean trajectory plot saved to results/trajectory_clean.png")
+    plot_all(gt_xy, pred_xy, "pinn_delta_physics")
+
 
 if __name__ == "__main__":
     main()

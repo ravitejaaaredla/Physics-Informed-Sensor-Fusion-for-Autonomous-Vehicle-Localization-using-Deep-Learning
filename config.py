@@ -1,60 +1,89 @@
-import torch
+# config.py
+
 class Config:
-    kitti_raw_root = "data/kitti_raw"
-    kitti_root = "data/kitti_unified"
-    sequence = "00"
+    # ------------------------------------------------------------
+    # Dataset
+    # ------------------------------------------------------------
+    # Main/default KITTI raw sequence
+    seq_dir = "data/Kitti_raw/2011_09_26-3/2011_09_26_drive_0009_sync"
+
+    # Multi-drive evaluation sequences
+    raw_sequence_dirs = [
+        "data/Kitti_raw/2011_09_26-3/2011_09_26_drive_0009_sync",
+        "data/Kitti_raw/2011_09_26-6/2011_09_26_drive_0011_sync",
+        "data/Kitti_raw/2011_09_26-5/2011_09_26_drive_0013_sync",
+        "data/Kitti_raw/2011_09_26-7/2011_09_26_drive_0014_sync",
+    ]
+
     max_frames = 500
-    imu_rate = 100.0
-    gnss_rate = 10.0
-    lidar_rate = 10.0
-    camera_rate = 10.0
-    lidar_dt = 1.0 / imu_rate
-    bev_x_range = (-30.0, 30.0)
-    bev_y_range = (0.0, 70.0)
-    bev_z_range = (-2.0, 3.0)
-    bev_resolution = 0.1
+    dt = 0.1
+
+    # ------------------------------------------------------------
+    # Windowed temporal training
+    # ------------------------------------------------------------
+    window_size = 10
+    stride = 1
+
+    # ------------------------------------------------------------
+    # Sensor dimensions
+    # ------------------------------------------------------------
     imu_input_dim = 6
-    imu_hidden_dim = 128
-    imu_tcn_kernel = 5
-    imu_tcn_layers = 4
+
+    # Keep this at 1024 if your model was trained with 1024.
+    # If you change this, you must retrain the model.
     lidar_num_points = 1024
     lidar_point_dim = 3
     lidar_feat_dim = 64
+
+    # Keep image size same as training.
+    # If you change this, retrain.
     camera_img_h = 128
     camera_img_w = 416
     camera_feat_dim = 64
+
+    # ------------------------------------------------------------
+    # Model dimensions
+    # ------------------------------------------------------------
+    imu_hidden_dim = 128
+    imu_tcn_kernel = 5
+    imu_tcn_layers = 4
+
     common_dim = 256
     num_attention_heads = 4
+
+    # Model output:
+    # [dx_body, dy_body, dv, dyaw]
     output_dim = 4
-    batch_size = 32
-    num_epochs = 50
+
+    dropout = 0.2
+
+    # ------------------------------------------------------------
+    # Training
+    # ------------------------------------------------------------
+    batch_size = 16
+    num_epochs = 80
     learning_rate = 1e-3
     weight_decay = 1e-5
-    dropout = 0.2
-    gnss_dropout_prob = 0.2
-    max_outage_sec = 3.0
+
+    # ------------------------------------------------------------
+    # Loss weights
+    # ------------------------------------------------------------
     lambda_data = 1.0
-    lambda_physics = 0.5
+    lambda_physics = 0.2
     lambda_smooth = 0.01
-    adaptive_loss_weights = True
-    model_type = "pure_dl"
-    accel_bias_std = 3e-3 * 9.81
-    gyro_bias_std = 10 * (3.14159/180) / 3600
-    accel_bias_walk = 1e-4 / (100**0.5)
-    gyro_bias_walk = 1e-5 / (100**0.5)
-    process_noise_acc = 120e-6 * 9.81
-    process_noise_gyro = 0.007 * (3.14159/180)
+
+    # ------------------------------------------------------------
+    # EKF / Localization
+    # ------------------------------------------------------------
+    gnss_rate = 10.0
     gnss_noise_std = 1.0
-    lidar_odom_pos_noise = 0.05
-    lidar_odom_att_noise = 0.005
-    init_pos_std = 1.0
-    init_vel_std = 0.5
-    init_att_std = 0.1
-    init_bias_acc_std = 0.01
-    init_bias_gyro_std = 0.001
-    bev_dim = None
-kitti_raw_root = "data/kitti_raw"
-kitti_raw_root = "data/kitti_raw"
-kitti_raw_root = "data/kitti_raw"
-kitti_raw_root = "data/kitti_raw"
-kitti_root = "data/kitti_unified"
+
+    process_noise_pos = 0.5
+    process_noise_vel = 0.5
+    process_noise_yaw = 0.1
+
+    # ------------------------------------------------------------
+    # Misc
+    # ------------------------------------------------------------
+    seed = 42
+    model_type = "pinn_delta"

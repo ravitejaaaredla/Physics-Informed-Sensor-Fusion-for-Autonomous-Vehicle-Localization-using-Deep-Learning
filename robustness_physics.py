@@ -1,119 +1,287 @@
-import torch
+# robustness_physics.py
+
+import os
+from copy import deepcopy
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
-import os
-from tqdm import tqdm
-from pathlib import Path
+import torch
 from PIL import Image
+from tqdm import tqdm
+
 from config import Config
 from src.models import FusionModel
-from src.eval.metrics import ATE, RPE
 
-def load_raw_sequence_norm(seq_dir, config):
+
+def wrap_angle(angle):
+    return (angle + np.pi) % (2 * np.pi) - np.pi
+
+
+def ate(pred_xy, gt_xy):
+    n = min(len(pred_xy), len(gt_xy))
+    pred_xy = pred_xy[:n]
+    gt_xy = gt_xy[:n]
+    return float(np.sqrt(np.mean(np.sum((pred_xy - gt_xy) ** 2, axis=1))))
+
+
+def rpe(pred_xy, gt_xy):
+    n = min(len(pred_xy), len(gt_xy))
+    pred_xy = pred_xy[:n]
+    gt_xy = gt_xy[:n]
+
+    if n < 2:
+        return float("nan")
+
+    pred_rel = pred_xy[1:] - pred_xy[:-1]
+    gt_rel = gt_xy[1:] - gt_xy[:-1]
+    return float(np.sqrt(np.mean(np.sum((pred_rel - gt_rel) ** 2, axis=1))))
+
+
+def load_raw_sequence(seq_dir, config):
     root = Path(seq_dir)
+
     poses_file = root / "poses.txt"
+    if not poses_file.exists():
+        raise FileNotFoundError(f"poses.txt not found: {poses_file}")
+
     poses = np.loadtxt(poses_file).reshape(-1, 3, 4)
     num_frames = min(config.max_frames, len(poses))
     poses = poses[:num_frames]
-    targets = []
+
+    states = []
+
     for i in range(num_frames):
         p = poses[i, :3, 3]
-        Rmat = poses[i, :3, :3]
-        yaw = np.arctan2(Rmat[1,0], Rmat[0,0])
+        R = poses[i, :3, :3]
+
+        x = p[0]
+        y = p[1]
+        yaw = np.arctan2(R[1, 0], R[0, 0])
+
         if i == 0:
             v = 0.0
         else:
-            dt = 0.1
-            dp = p - poses[i-1, :3, 3]
-            v = np.linalg.norm(dp) / dt
-        targets.append([p[0], p[1], v, yaw])
-    targets = np.array(targets)
-    pos_mean = np.mean(targets[:,:2], axis=0)
-    pos_std = np.std(targets[:,:2], axis=0) + 1e-8
-    targets_norm = targets.copy()
-    targets_norm[:,:2] = (targets[:,:2] - pos_mean) / pos_std
-    return targets_norm, targets, pos_mean, pos_std
+            dp = poses[i, :3, 3] - poses[i - 1, :3, 3]
+            v = np.linalg.norm(dp) / config.dt
 
-def load_sensor_data(seq_dir, num_frames, config):
-    root = Path(seq_dir)
+        states.append([x, y, v, yaw])
+
+    states = np.asarray(states, dtype=np.float32)
+
     lidar_pts = []
+    velo_dir = root / "velodyne_points" / "data"
+
     for i in range(num_frames):
-        bin_file = root / "velodyne_points" / "data" / f"{i:010d}.bin"
-        if bin_file.exists():
-            pts = np.fromfile(bin_file, dtype=np.float32).reshape(-1, 4)[:,:3]
-            idx = np.random.choice(len(pts), min(1024, len(pts)), replace=False)
-            pts = pts[idx]
-            lidar_pts.append(pts.astype(np.float32))
+        bin_file = velo_dir / f"{i:010d}.bin"
+        if not bin_file.exists():
+            raise FileNotFoundError(f"Missing LiDAR file: {bin_file}")
+
+        pts = np.fromfile(bin_file, dtype=np.float32).reshape(-1, 4)[:, :3]
+
+        if len(pts) >= config.lidar_num_points:
+            idx = np.random.choice(len(pts), config.lidar_num_points, replace=False)
         else:
-            lidar_pts.append(np.random.randn(1024,3).astype(np.float32))
+            idx = np.random.choice(len(pts), config.lidar_num_points, replace=True)
+
+        lidar_pts.append(pts[idx].astype(np.float32))
+
     cam_imgs = []
+    img_dir = root / "image_02" / "data"
+
     for i in range(num_frames):
-        img_file = root / "image_02" / "data" / f"{i:010d}.png"
-        if img_file.exists():
-            img = Image.open(img_file).resize((config.camera_img_w, config.camera_img_h))
-            img = np.array(img, dtype=np.float32) / 255.0
-            cam_imgs.append(img)
-        else:
-            cam_imgs.append(np.zeros((config.camera_img_h, config.camera_img_w, 3), dtype=np.float32))
-    oxts_dir = root / "oxts" / "data"
+        img_file = img_dir / f"{i:010d}.png"
+        if not img_file.exists():
+            raise FileNotFoundError(f"Missing camera file: {img_file}")
+
+        img = Image.open(img_file).convert("RGB")
+        img = img.resize((config.camera_img_w, config.camera_img_h))
+        img = np.asarray(img, dtype=np.float32) / 255.0
+        cam_imgs.append(img)
+
     imu_data = []
+    oxts_dir = root / "oxts" / "data"
+
     for i in range(num_frames):
         oxts_file = oxts_dir / f"{i:010d}.txt"
-        if oxts_file.exists():
-            oxts = np.loadtxt(oxts_file)
-            imu = oxts[11:14].tolist() + oxts[17:20].tolist()
-            imu_data.append(imu)
-        else:
-            imu_data.append([0,0,0,0,0,0])
-    imu_data = np.array(imu_data, dtype=np.float32)
-    return lidar_pts, cam_imgs, imu_data
+        if not oxts_file.exists():
+            raise FileNotFoundError(f"Missing OXTS file: {oxts_file}")
 
-def evaluate_model(model, imus, lidar_pts, cams, targets, device):
-    imu_t = torch.tensor(imus, dtype=torch.float32).unsqueeze(1).to(device)
-    lidar_t = torch.stack([torch.tensor(p, dtype=torch.float32) for p in lidar_pts]).to(device)
-    cam_t = torch.stack([torch.tensor(c, dtype=torch.float32).permute(2,0,1) for c in cams]).to(device)
+        oxts = np.loadtxt(oxts_file)
+        imu = oxts[11:14].tolist() + oxts[17:20].tolist()
+        imu_data.append(imu)
+
+    imu_data = np.asarray(imu_data, dtype=np.float32)
+
+    return states, lidar_pts, cam_imgs, imu_data
+
+
+def integrate_delta_model(model, states, lidar_pts, cam_imgs, imu_data, config, device):
     model.eval()
-    with torch.no_grad():
-        pred_norm = model(imu_t, lidar_t, cam_t).cpu().numpy()
-    return ATE(pred_norm[:,:2], targets[:,:2]), RPE(pred_norm[:,:2], targets[:,:2])
 
-def add_imu_noise(imu, noise_std=0.05):
-    return imu + np.random.normal(0, noise_std, imu.shape)
+    pred_states = []
 
-def occlude_lidar(points, keep_ratio=0.5):
-    n = len(points)
-    keep = np.random.choice(n, int(n*keep_ratio), replace=False)
-    return points[keep]
+    x, y, v, yaw = states[0]
+    pred_states.append([x, y, v, yaw])
+
+    for end in range(config.window_size - 1, len(states) - 1):
+        start = end - config.window_size + 1
+
+        imu_win = imu_data[start : end + 1]
+        lidar = lidar_pts[end]
+        cam = cam_imgs[end]
+
+        imu_t = torch.tensor(imu_win, dtype=torch.float32).unsqueeze(0).to(device)
+        lidar_t = torch.tensor(lidar, dtype=torch.float32).unsqueeze(0).to(device)
+        cam_t = (
+            torch.tensor(cam, dtype=torch.float32)
+            .permute(2, 0, 1)
+            .unsqueeze(0)
+            .to(device)
+        )
+
+        with torch.no_grad():
+            delta = model(imu_t, lidar_t, cam_t).cpu().numpy()[0]
+
+        dx_b, dy_b, dv, dyaw = delta
+
+        c = np.cos(yaw)
+        s = np.sin(yaw)
+
+        dx_w = c * dx_b - s * dy_b
+        dy_w = s * dx_b + c * dy_b
+
+        x = x + dx_w
+        y = y + dy_w
+        v = max(0.0, v + dv)
+        yaw = wrap_angle(yaw + dyaw)
+
+        pred_states.append([x, y, v, yaw])
+
+    return np.asarray(pred_states, dtype=np.float32)
+
+
+def add_imu_noise(imu_data, noise_std):
+    return imu_data + np.random.normal(0.0, noise_std, size=imu_data.shape).astype(np.float32)
+
+
+def occlude_lidar(lidar_pts, keep_ratio, config):
+    occluded = []
+
+    for pts in lidar_pts:
+        n = len(pts)
+        keep_n = max(8, int(n * keep_ratio))
+        idx = np.random.choice(n, keep_n, replace=False)
+        kept = pts[idx]
+
+        if len(kept) >= config.lidar_num_points:
+            idx2 = np.random.choice(len(kept), config.lidar_num_points, replace=False)
+        else:
+            idx2 = np.random.choice(len(kept), config.lidar_num_points, replace=True)
+
+        occluded.append(kept[idx2].astype(np.float32))
+
+    return occluded
+
+
+def evaluate(model, states, lidar_pts, cam_imgs, imu_data, config, device):
+    pred_states = integrate_delta_model(
+        model,
+        states,
+        lidar_pts,
+        cam_imgs,
+        imu_data,
+        config,
+        device,
+    )
+
+    pred_xy = pred_states[:, :2]
+    gt_xy = states[: len(pred_xy), :2]
+
+    return ate(pred_xy, gt_xy), rpe(pred_xy, gt_xy)
+
 
 def main():
     config = Config()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    seq_dir = "data/Kitti_raw/2011_09_26-3/2011_09_26_drive_0009_sync"
-    targets_norm, _, _, _ = load_raw_sequence_norm(seq_dir, config)
-    lidar_pts, cam_imgs, imu_data = load_sensor_data(seq_dir, len(targets_norm), config)
+
+    states, lidar_pts, cam_imgs, imu_data = load_raw_sequence(config.seq_dir, config)
+
+    model_path = "models/pinn_delta_physics.pth"
+    if not os.path.exists(model_path):
+        raise FileNotFoundError(
+            f"{model_path} not found. Run python train_physics_loss.py first."
+        )
+
     model = FusionModel(config).to(device)
-    model.load_state_dict(torch.load("models/pinn_physics.pth", map_location=device))
-
-    noise_levels = [0.05, 0.1, 0.2]
-    noise_results = []
-    for noise in tqdm(noise_levels, desc="Noise test"):
-        imus_noisy = add_imu_noise(imu_data, noise)
-        ate, rpe = evaluate_model(model, imus_noisy, lidar_pts, cam_imgs, targets_norm, device)
-        noise_results.append({"noise_std": noise, "ATE": ate, "RPE": rpe})
-    df_noise = pd.DataFrame(noise_results)
-
-    keep_ratios = [1.0, 0.7, 0.5, 0.3]
-    occ_results = []
-    for ratio in tqdm(keep_ratios, desc="Occlusion test"):
-        lidar_occ = [occlude_lidar(p, ratio) for p in lidar_pts]
-        ate, rpe = evaluate_model(model, imu_data, lidar_occ, cam_imgs, targets_norm, device)
-        occ_results.append({"keep_ratio": ratio, "ATE": ate, "RPE": rpe})
-    df_occ = pd.DataFrame(occ_results)
+    model.load_state_dict(torch.load(model_path, map_location=device))
+    model.eval()
 
     os.makedirs("results", exist_ok=True)
+
+    # ------------------------------------------------------------
+    # IMU noise robustness
+    # ------------------------------------------------------------
+    noise_levels = [0.0, 0.01, 0.05, 0.1, 0.2]
+    noise_rows = []
+
+    for noise in tqdm(noise_levels, desc="IMU noise robustness"):
+        noisy_imu = add_imu_noise(imu_data, noise)
+        test_ate, test_rpe = evaluate(
+            model,
+            states,
+            lidar_pts,
+            cam_imgs,
+            noisy_imu,
+            config,
+            device,
+        )
+
+        noise_rows.append(
+            {
+                "imu_noise_std": noise,
+                "ATE_m": test_ate,
+                "RPE_m": test_rpe,
+            }
+        )
+
+    df_noise = pd.DataFrame(noise_rows)
     df_noise.to_csv("results/noise_robustness_physics.csv", index=False)
+
+    # ------------------------------------------------------------
+    # LiDAR occlusion robustness
+    # ------------------------------------------------------------
+    keep_ratios = [1.0, 0.7, 0.5, 0.3]
+    occ_rows = []
+
+    for keep_ratio in tqdm(keep_ratios, desc="LiDAR occlusion robustness"):
+        lidar_occ = occlude_lidar(deepcopy(lidar_pts), keep_ratio, config)
+
+        test_ate, test_rpe = evaluate(
+            model,
+            states,
+            lidar_occ,
+            cam_imgs,
+            imu_data,
+            config,
+            device,
+        )
+
+        occ_rows.append(
+            {
+                "lidar_keep_ratio": keep_ratio,
+                "ATE_m": test_ate,
+                "RPE_m": test_rpe,
+            }
+        )
+
+    df_occ = pd.DataFrame(occ_rows)
     df_occ.to_csv("results/occlusion_robustness_physics.csv", index=False)
-    print("Robustness tests saved to results/")
+
+    print("Saved:")
+    print("  results/noise_robustness_physics.csv")
+    print("  results/occlusion_robustness_physics.csv")
+
 
 if __name__ == "__main__":
     main()
