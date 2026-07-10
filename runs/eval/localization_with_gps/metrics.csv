@@ -1,0 +1,11 @@
+metric,value
+mean_ate_m,1.0433424700798143e-05
+median_ate_m,9.476606035345722e-06
+max_ate_m,1.669416665821655e-05
+ate_95_percentile_m,1.5389657507906097e-05
+mean_rpe_m,1.24900573620781e-06
+median_rpe_m,1.0006844758518684e-06
+max_rpe_m,1.0375944535200086e-05
+rpe_95_percentile_m,2.80977500097238e-06
+gnss_denied_start,-1
+gnss_denied_len,0
