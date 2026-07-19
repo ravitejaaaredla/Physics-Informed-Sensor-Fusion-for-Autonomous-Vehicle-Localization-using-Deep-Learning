@@ -1,11 +1,12 @@
 import sys
 from pathlib import Path
 import argparse
-import random
-
-import numpy as np
+import time
 import torch
+import torch.nn as nn
+import torch.optim as optim
 from torch.utils.data import DataLoader
+import numpy as np
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
@@ -16,191 +17,226 @@ from src.models.fusion_pinn import FusionPINN
 from src.physics.physics_loss import compute_total_loss
 
 
-def set_seed(seed):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-
-
-def train_one_epoch(model, dataloader, optimizer, device):
+def train_one_epoch(model, dataloader, optimizer, device, config):
     model.train()
-
-    total_loss_sum = 0.0
-    data_loss_sum = 0.0
-    physics_loss_sum = 0.0
+    total_loss = 0.0
     num_batches = 0
+
+    target_mean = torch.tensor(config.target_mean, dtype=torch.float32).to(device)
+    target_std = torch.tensor(config.target_std, dtype=torch.float32).to(device)
+    lambda_data = config.lambda_data
+    lambda_physics = config.lambda_physics
+    lambda_imu = config.lambda_imu
+    imu_dyaw_scale = config.imu_dyaw_scale
 
     for batch in dataloader:
         camera = batch["camera"].to(device)
-        lidar_bev = batch["lidar_bev"].to(device)
+        lidar = batch["lidar_bev"].to(device)
         imu = batch["imu"].to(device)
         target = batch["target"].to(device)
 
+        imu_omega_z = imu[:, 5]  # Extract gyro z
+
         optimizer.zero_grad()
+        pred = model(camera, lidar, imu)
 
-        predicted_motion = model(camera, lidar_bev, imu)
-
-        losses = compute_total_loss(
-            predicted_motion,
-            target,
-            target_mean=Config.target_mean,
-            target_std=Config.target_std,
-            lambda_data=Config.lambda_data,
-            lambda_physics=Config.lambda_physics,
+        loss_dict = compute_total_loss(
+            pred, target,
+            target_mean, target_std,
+            imu_omega_z=imu_omega_z,
+            lambda_data=lambda_data,
+            lambda_physics=lambda_physics,
+            lambda_imu=lambda_imu,
+            imu_dyaw_scale=imu_dyaw_scale,
+            dt=0.1,
         )
+        loss = loss_dict["total_loss"]
 
-        loss = losses["total_loss"]
+        # ========== DIAGNOSTIC ==========
+        if num_batches % 100 == 0:
+            with torch.no_grad():
+                imu_feat = model.imu_encoder(imu)
+                imu_feat_mean = imu_feat.abs().mean().item()
+            print(f"  Batch {num_batches:4d} | Data Loss: {loss_dict['data_loss'].item():.6f} | Physics Loss: {loss_dict['physics_loss'].item():.6f} | IMU Loss: {loss_dict['imu_loss'].item():.6f} | IMU Feat Mean: {imu_feat_mean:.6f}")
+        # =================================
+
         loss.backward()
         optimizer.step()
 
-        total_loss_sum += float(losses["total_loss"].detach().cpu())
-        data_loss_sum += float(losses["data_loss"].detach().cpu())
-        physics_loss_sum += float(losses["physics_loss"].detach().cpu())
+        total_loss += loss.item()
         num_batches += 1
 
-    return {
-        "total_loss": total_loss_sum / num_batches,
-        "data_loss": data_loss_sum / num_batches,
-        "physics_loss": physics_loss_sum / num_batches,
-    }
+    return total_loss / num_batches if num_batches > 0 else 0.0
 
 
-def validate_one_epoch(model, dataloader, device):
+def validate_one_epoch(model, dataloader, device, config):
+    if dataloader is None or len(dataloader) == 0:
+        return {
+            "total_loss": 0.0,
+            "data_loss": 0.0,
+            "physics_loss": 0.0,
+            "imu_loss": 0.0,
+        }
+
     model.eval()
-
     total_loss_sum = 0.0
     data_loss_sum = 0.0
     physics_loss_sum = 0.0
+    imu_loss_sum = 0.0
     num_batches = 0
+
+    target_mean = torch.tensor(config.target_mean, dtype=torch.float32).to(device)
+    target_std = torch.tensor(config.target_std, dtype=torch.float32).to(device)
+    lambda_data = config.lambda_data
+    lambda_physics = config.lambda_physics
+    lambda_imu = config.lambda_imu
+    imu_dyaw_scale = config.imu_dyaw_scale
 
     with torch.no_grad():
         for batch in dataloader:
             camera = batch["camera"].to(device)
-            lidar_bev = batch["lidar_bev"].to(device)
+            lidar = batch["lidar_bev"].to(device)
             imu = batch["imu"].to(device)
             target = batch["target"].to(device)
+            imu_omega_z = imu[:, 5]
 
-            predicted_motion = model(camera, lidar_bev, imu)
-
-            losses = compute_total_loss(
-                predicted_motion,
-                target,
-                target_mean=Config.target_mean,
-                target_std=Config.target_std,
-                lambda_data=Config.lambda_data,
-                lambda_physics=Config.lambda_physics,
+            pred = model(camera, lidar, imu)
+            loss_dict = compute_total_loss(
+                pred, target,
+                target_mean, target_std,
+                imu_omega_z=imu_omega_z,
+                lambda_data=lambda_data,
+                lambda_physics=lambda_physics,
+                lambda_imu=lambda_imu,
+                imu_dyaw_scale=imu_dyaw_scale,
+                dt=0.1,
             )
 
-            total_loss_sum += float(losses["total_loss"].detach().cpu())
-            data_loss_sum += float(losses["data_loss"].detach().cpu())
-            physics_loss_sum += float(losses["physics_loss"].detach().cpu())
+            total_loss_sum += loss_dict["total_loss"].item()
+            data_loss_sum += loss_dict["data_loss"].item()
+            physics_loss_sum += loss_dict["physics_loss"].item()
+            imu_loss_sum += loss_dict["imu_loss"].item()
             num_batches += 1
 
     return {
         "total_loss": total_loss_sum / num_batches,
         "data_loss": data_loss_sum / num_batches,
         "physics_loss": physics_loss_sum / num_batches,
+        "imu_loss": imu_loss_sum / num_batches,
     }
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--epochs", type=int, default=30)
+    parser.add_argument("--epochs", type=int, default=80, help="Number of training epochs")
+    parser.add_argument("--batch_size", type=int, default=16, help="Batch size")
+    parser.add_argument("--lr", type=float, default=1e-3, help="Default learning rate for non-IMU layers")
+    parser.add_argument("--lr_imu", type=float, default=5e-3, help="Learning rate for IMU branch")
     args = parser.parse_args()
 
     print("=" * 80)
     print("08 - TRAIN SENSOR FUSION LOCALIZATION MODEL")
     print("=" * 80)
-
-    set_seed(Config.seed)
-
     print("Project root:", PROJECT_ROOT)
 
+    train_dataset = KITTIRawDataset(Config.train_sequence_dirs, max_frames=Config.max_frames)
+    val_dataset = KITTIRawDataset(Config.val_sequence_dirs, max_frames=Config.max_frames) if Config.val_sequence_dirs else None
+
     print("\nTraining drives:")
-    for p in Config.train_sequence_dirs:
-        print(" ", p)
+    for d in Config.train_sequence_dirs:
+        print(f"  {d}")
 
     print("\nValidation drives:")
-    for p in Config.val_sequence_dirs:
-        print(" ", p)
-
-    train_dataset = KITTIRawDataset(
-        Config.train_sequence_dirs,
-        max_frames=Config.max_frames,
-    )
-
-    val_dataset = KITTIRawDataset(
-        Config.val_sequence_dirs,
-        max_frames=Config.max_frames,
-    )
+    if Config.val_sequence_dirs:
+        for d in Config.val_sequence_dirs:
+            print(f"  {d}")
+    else:
+        print("  (none)")
 
     print("\nDataset size")
-    print("Training samples  :", len(train_dataset))
-    print("Validation samples:", len(val_dataset))
-
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=Config.batch_size,
-        shuffle=True,
-        num_workers=0,
-    )
-
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=Config.batch_size,
-        shuffle=False,
-        num_workers=0,
-    )
+    print(f"Training samples  : {len(train_dataset)}")
+    print(f"Validation samples: {len(val_dataset) if val_dataset else 0}")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("\nDevice:", device)
 
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False) if val_dataset else None
+
     model = FusionPINN(Config).to(device)
 
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=Config.learning_rate,
-        weight_decay=Config.weight_decay,
-    )
+    # ========== RESUME FROM CHECKPOINT ==========
+    checkpoint_path = Config.checkpoint_dir / "model_best.pth"
+    if checkpoint_path.exists():
+        print(f"\nLoading existing checkpoint: {checkpoint_path}")
+        model.load_state_dict(torch.load(checkpoint_path, map_location=device))
+        print("✅ Checkpoint loaded. Continuing training...")
+    else:
+        print("\nNo checkpoint found. Starting from scratch.")
+    # ============================================
 
-    Config.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    # ========== SEPARATE LEARNING RATES ==========
+    imu_params = []
+    other_params = []
+    for name, param in model.named_parameters():
+        if 'imu_encoder' in name or 'imu_to_dyaw' in name:
+            imu_params.append(param)
+        else:
+            other_params.append(param)
 
-    best_val_loss = float("inf")
-    best_model_path = Config.checkpoint_dir / "model_best.pth"
-    last_model_path = Config.checkpoint_dir / "model_last.pth"
+    optimizer = optim.Adam([
+        {'params': imu_params, 'lr': args.lr_imu},
+        {'params': other_params, 'lr': args.lr}
+    ], weight_decay=Config.weight_decay)
+    # =============================================
 
     print("\nTraining setup")
-    print("Epochs       :", args.epochs)
-    print("Batch size   :", Config.batch_size)
-    print("Learning rate:", Config.learning_rate)
+    print(f"Epochs          : {args.epochs}")
+    print(f"Batch size      : {args.batch_size}")
+    print(f"Default LR      : {args.lr}")
+    print(f"IMU branch LR   : {args.lr_imu}")
+    print(f"Lambda data     : {Config.lambda_data}")
+    print(f"Lambda physics  : {Config.lambda_physics}")
+    print(f"Lambda IMU      : {Config.lambda_imu}")
+    print(f"IMU dyaw scale  : {Config.imu_dyaw_scale}")
 
     print("\nStarting training...")
 
+    best_loss = float("inf")
+    best_epoch = 0
+
     for epoch in range(1, args.epochs + 1):
-        train_losses = train_one_epoch(model, train_loader, optimizer, device)
-        val_losses = validate_one_epoch(model, val_loader, device)
+        start_time = time.time()
 
-        print(
-            f"Epoch {epoch:03d}/{args.epochs} | "
-            f"Train Total: {train_losses['total_loss']:.8f} | "
-            f"Train Data: {train_losses['data_loss']:.8f} | "
-            f"Train Physics: {train_losses['physics_loss']:.8f} | "
-            f"Val Total: {val_losses['total_loss']:.8f} | "
-            f"Val Data: {val_losses['data_loss']:.8f} | "
-            f"Val Physics: {val_losses['physics_loss']:.8f}"
-        )
+        train_loss = train_one_epoch(model, train_loader, optimizer, device, Config)
 
-        torch.save(model.state_dict(), last_model_path)
+        if val_loader is not None and len(val_loader) > 0:
+            val_metrics = validate_one_epoch(model, val_loader, device, Config)
+            val_loss = val_metrics["total_loss"]
+            imu_loss_val = val_metrics["imu_loss"]
+        else:
+            val_loss = None
+            imu_loss_val = None
 
-        if val_losses["total_loss"] < best_val_loss:
-            best_val_loss = val_losses["total_loss"]
-            torch.save(model.state_dict(), best_model_path)
-            print("  Saved best model:", best_model_path)
+        elapsed = time.time() - start_time
 
-    print("\nDONE")
-    print("Best validation loss:", best_val_loss)
-    print("Best model saved at:")
-    print(best_model_path)
+        if val_loss is not None:
+            print(f"Epoch {epoch:3d}/{args.epochs} | Train Loss: {train_loss:.6f} | Val Loss: {val_loss:.6f} | IMU Loss: {imu_loss_val:.6f} | Time: {elapsed:.1f}s")
+            current_loss = val_loss
+        else:
+            print(f"Epoch {epoch:3d}/{args.epochs} | Train Loss: {train_loss:.6f} | Time: {elapsed:.1f}s")
+            current_loss = train_loss
+
+        if current_loss < best_loss:
+            best_loss = current_loss
+            best_epoch = epoch
+            torch.save(model.state_dict(), Config.checkpoint_dir / "model_best.pth")
+            print(f"  -> Best model saved (loss: {best_loss:.6f})")
+
+    print("\n" + "=" * 80)
+    print(f"Training finished! Best model at epoch {best_epoch} with loss {best_loss:.6f}")
+    print(f"Saved to: {Config.checkpoint_dir / 'model_best.pth'}")
+    print("=" * 80)
 
 
 if __name__ == "__main__":

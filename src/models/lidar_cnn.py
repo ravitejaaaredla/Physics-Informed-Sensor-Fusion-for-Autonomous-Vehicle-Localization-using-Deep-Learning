@@ -1,46 +1,33 @@
+import torch
 import torch.nn as nn
-
+import torch.nn.functional as F
 
 class LidarCNN(nn.Module):
-    """
-    LiDAR BEV CNN.
-
-    Input:
-        [B, 3, 256, 256]
-
-    Layers:
-        Conv stride 2: [B, 16, 128, 128]
-        Conv stride 2: [B, 32, 64, 64]
-        Conv stride 2: [B, 64, 32, 32]
-        Global average pooling: [B, 64, 1, 1]
-        Flatten: [B, 64]
-
-    Output:
-        [B, 64]
-    """
-
-    def __init__(self, output_dim=64):
+    def __init__(self, config):
         super().__init__()
+        # config contains: bev_shape, lidar_feat_dim
+        self.conv1 = nn.Conv2d(3, 16, kernel_size=3, stride=2, padding=1)
+        self.bn1 = nn.BatchNorm2d(16)
+        self.conv2 = nn.Conv2d(16, 32, kernel_size=3, stride=2, padding=1)
+        self.bn2 = nn.BatchNorm2d(32)
+        self.conv3 = nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1)
+        self.bn3 = nn.BatchNorm2d(64)
+        self.conv4 = nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1)
+        self.bn4 = nn.BatchNorm2d(128)
+        self.conv5 = nn.Conv2d(128, 256, kernel_size=3, stride=2, padding=1)
+        self.bn5 = nn.BatchNorm2d(256)
+        self.gap = nn.AdaptiveAvgPool2d((1, 1))
+        self.fc = nn.Linear(256, config.lidar_feat_dim)
+        self.relu = nn.ReLU(inplace=True)
+        self.dropout = nn.Dropout(config.dropout if hasattr(config, 'dropout') else 0.2)
 
-        self.cnn = nn.Sequential(
-            nn.Conv2d(3, 16, kernel_size=5, stride=2, padding=2),
-            nn.BatchNorm2d(16),
-            nn.ReLU(),
-
-            nn.Conv2d(16, 32, kernel_size=3, stride=2, padding=1),
-            nn.BatchNorm2d(32),
-            nn.ReLU(),
-
-            nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),
-            nn.BatchNorm2d(64),
-            nn.ReLU(),
-
-            nn.AdaptiveAvgPool2d((1, 1)),
-        )
-
-        self.fc = nn.Linear(64, output_dim)
-
-    def forward(self, lidar_bev):
-        x = self.cnn(lidar_bev)
-        x = x.flatten(start_dim=1)
-        return self.fc(x)
+    def forward(self, x):
+        x = self.relu(self.bn1(self.conv1(x)))
+        x = self.relu(self.bn2(self.conv2(x)))
+        x = self.relu(self.bn3(self.conv3(x)))
+        x = self.relu(self.bn4(self.conv4(x)))
+        x = self.relu(self.bn5(self.conv5(x)))
+        x = self.gap(x)
+        x = x.view(x.size(0), -1)
+        x = self.fc(x)
+        return x

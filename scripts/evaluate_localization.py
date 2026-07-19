@@ -21,18 +21,14 @@ from src.evaluation.metrics import compute_ate, compute_rpe
 def should_use_gnss(frame_index, gnss_denied_start, gnss_denied_len):
     if gnss_denied_start < 0 or gnss_denied_len <= 0:
         return True
-
     denied_end = gnss_denied_start + gnss_denied_len
-
     if gnss_denied_start <= frame_index < denied_end:
         return False
-
     return True
 
 
 def save_metrics(output_dir, ate, rpe, gnss_denied_start, gnss_denied_len):
     metrics_file = output_dir / "metrics.csv"
-
     rows = [
         ["metric", "value"],
         ["mean_ate_m", float(np.mean(ate))],
@@ -46,20 +42,16 @@ def save_metrics(output_dir, ate, rpe, gnss_denied_start, gnss_denied_len):
         ["gnss_denied_start", gnss_denied_start],
         ["gnss_denied_len", gnss_denied_len],
     ]
-
     with open(metrics_file, "w", newline="") as f:
         writer = csv.writer(f)
         writer.writerows(rows)
-
     print("Saved metrics:", metrics_file)
 
 
 def save_latlon_csv(output_dir, trajectory_rows):
     csv_file = output_dir / "trajectory_latlon.csv"
-
     with open(csv_file, "w", newline="") as f:
         writer = csv.writer(f)
-
         writer.writerow(
             [
                 "frame",
@@ -74,45 +66,17 @@ def save_latlon_csv(output_dir, trajectory_rows):
                 "use_gnss",
             ]
         )
-
         writer.writerows(trajectory_rows)
-
     print("Saved trajectory lat/lon CSV:", csv_file)
 
 
 def plot_trajectory(output_dir, predicted_xy, ground_truth_xy, title):
     output_file = output_dir / "trajectory.png"
-
     plt.figure(figsize=(8, 6))
-
-    plt.plot(
-        ground_truth_xy[:, 0],
-        ground_truth_xy[:, 1],
-        label="Ground truth OXTS",
-        linewidth=2,
-    )
-
-    plt.plot(
-        predicted_xy[:, 0],
-        predicted_xy[:, 1],
-        label="PINN + EKF prediction",
-        linewidth=2,
-    )
-
-    plt.scatter(
-        ground_truth_xy[0, 0],
-        ground_truth_xy[0, 1],
-        s=80,
-        label="Start",
-    )
-
-    plt.scatter(
-        ground_truth_xy[-1, 0],
-        ground_truth_xy[-1, 1],
-        s=80,
-        label="End",
-    )
-
+    plt.plot(ground_truth_xy[:, 0], ground_truth_xy[:, 1], label="Ground truth OXTS", linewidth=2)
+    plt.plot(predicted_xy[:, 0], predicted_xy[:, 1], label="EKF + IMU (GT motion)", linewidth=2)
+    plt.scatter(ground_truth_xy[0, 0], ground_truth_xy[0, 1], s=80, label="Start")
+    plt.scatter(ground_truth_xy[-1, 0], ground_truth_xy[-1, 1], s=80, label="End")
     plt.xlabel("x position [m]")
     plt.ylabel("y position [m]")
     plt.title(title)
@@ -122,21 +86,17 @@ def plot_trajectory(output_dir, predicted_xy, ground_truth_xy, title):
     plt.tight_layout()
     plt.savefig(output_file, dpi=200)
     plt.close()
-
     print("Saved trajectory plot:", output_file)
 
 
 def plot_ate(output_dir, ate, gnss_denied_start, gnss_denied_len):
     output_file = output_dir / "ate.png"
-
     plt.figure(figsize=(10, 4))
     plt.plot(ate, label="ATE")
-
     if gnss_denied_start >= 0 and gnss_denied_len > 0:
         start = gnss_denied_start
         end = gnss_denied_start + gnss_denied_len
         plt.axvspan(start, end, alpha=0.2, label="GNSS denied interval")
-
     plt.xlabel("Frame")
     plt.ylabel("ATE [m]")
     plt.title("Absolute Trajectory Error")
@@ -145,7 +105,6 @@ def plot_ate(output_dir, ate, gnss_denied_start, gnss_denied_len):
     plt.tight_layout()
     plt.savefig(output_file, dpi=200)
     plt.close()
-
     print("Saved ATE plot:", output_file)
 
 
@@ -153,6 +112,11 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--gnss_denied_start", type=int, default=-1)
     parser.add_argument("--gnss_denied_len", type=int, default=0)
+    parser.add_argument("--start_frame", type=int, default=0)
+    parser.add_argument("--num_frames", type=int, default=None)
+    parser.add_argument("--use_imu_dyaw", action="store_true", help="Use IMU gyroscope for dyaw")
+    parser.add_argument("--use_gt_motion", action="store_true", help="Use ground truth motion (dx, dy, dv)")
+    parser.add_argument("--imu_scale", type=float, default=0.8, help="Scaling factor for IMU yaw rate (0.5-1.2)")
     args = parser.parse_args()
 
     print("=" * 80)
@@ -162,37 +126,41 @@ def main():
     print("Project root:", PROJECT_ROOT)
     print("Test drive:", Config.test_sequence_dir)
 
-    dataset = KITTIRawDataset(
-        [Config.test_sequence_dir],
-        max_frames=Config.max_frames,
-    )
-
+    dataset = KITTIRawDataset([Config.test_sequence_dir], max_frames=Config.max_frames)
     print("Number of test samples:", len(dataset))
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("Device:", device)
 
     model_path = Config.checkpoint_dir / "model_best.pth"
-
     if not model_path.exists():
-        raise FileNotFoundError(
-            f"Model not found: {model_path}. Train first using scripts/08_train_model.py"
-        )
-
+        raise FileNotFoundError(f"Model not found: {model_path}. Train first.")
     model = FusionPINN(Config).to(device)
     model.load_state_dict(torch.load(model_path, map_location=device))
     model.eval()
-
     print("Loaded model:", model_path)
 
-    first_sample = dataset[0]
-    first_aux = first_sample["aux"]
+    if args.use_imu_dyaw:
+        print(f"\n>>> Using IMU gyroscope for dyaw (scale = {args.imu_scale}) <<<")
+    if args.use_gt_motion:
+        print("\n>>> Using GROUND TRUTH motion for dx, dy, dv <<<")
 
+    # ========== IMPROVED BIAS ESTIMATION (50 frames) ==========
+    print("\nEstimating IMU gyroscope bias from first 50 frames...")
+    bias_samples = []
+    for i in range(min(50, len(dataset))):   # increased from 10 to 50
+        imu = dataset[i]["imu"].numpy()
+        bias_samples.append(imu[5])          # omega_z
+    imu_bias = np.mean(bias_samples)
+    print(f"IMU gyroscope bias (omega_z) = {imu_bias:.6f} rad/s")
+    # ===========================================================
+
+    first_sample = dataset[args.start_frame]
+    first_aux = first_sample["aux"]
     origin_lat = first_aux["lat_now"]
     origin_lon = first_aux["lon_now"]
 
     ekf = FourStateEKF(Config)
-
     ekf.initialize(
         x=first_aux["x_now"],
         y=first_aux["y_now"],
@@ -202,65 +170,98 @@ def main():
 
     print("\nInitial EKF state:")
     print(ekf.x)
-
     print("\nOrigin latitude/longitude:")
     print(origin_lat, origin_lon)
+
+    target_mean = np.array(Config.target_mean)
+    target_std = np.array(Config.target_std)
+    print(f"\nLoaded denorm stats: Mean={target_mean}, Std={target_std}")
 
     predicted_positions = []
     ground_truth_positions = []
     trajectory_rows = []
 
-    for frame_index in range(len(dataset)):
-        sample = dataset[frame_index]
+    start = args.start_frame
+    end = len(dataset) if args.num_frames is None else min(start + args.num_frames, len(dataset))
 
+    prev_aux = None
+
+    for frame_index in range(start, end):
+        sample = dataset[frame_index]
         camera = sample["camera"].unsqueeze(0).to(device)
         lidar_bev = sample["lidar_bev"].unsqueeze(0).to(device)
         imu = sample["imu"].unsqueeze(0).to(device)
         aux = sample["aux"]
 
-        with torch.no_grad():
-            predicted_motion = model(camera, lidar_bev, imu)
+        gt_dyaw = aux["yaw_next"] - aux["yaw_now"]
 
-        predicted_motion = predicted_motion[0].detach().cpu().numpy()
+        # --- Motion inputs ---
+        if args.use_gt_motion:
+            if prev_aux is not None:
+                dx_world = aux["x_now"] - prev_aux["x_now"]
+                dy_world = aux["y_now"] - prev_aux["y_now"]
+                yaw_prev = prev_aux["yaw_now"]
+                dx_body = np.cos(yaw_prev) * dx_world + np.sin(yaw_prev) * dy_world
+                dy_body = -np.sin(yaw_prev) * dx_world + np.cos(yaw_prev) * dy_world
+                dv = aux["speed_now"] - prev_aux["speed_now"]
+            else:
+                dx_body, dy_body, dv = 0.0, 0.0, 0.0
+            prev_aux = aux
+        else:
+            with torch.no_grad():
+                predicted_motion = model(camera, lidar_bev, imu)
+            pred_motion_norm = predicted_motion[0].detach().cpu().numpy()
+            pred_motion_phys = (pred_motion_norm * target_std) + target_mean
+            dx_body = float(pred_motion_phys[0])
+            dy_body = float(pred_motion_phys[1])
+            dv = float(pred_motion_phys[2])
 
-        dx_body = float(predicted_motion[0])
-        dy_body = float(predicted_motion[1])
-        dv = float(predicted_motion[2])
-        dyaw = float(predicted_motion[3])
+        # --- dyaw with bias correction and scaling ---
+        if args.use_imu_dyaw:
+            imu_omega_z_raw = imu[0, 5].item()
+            imu_omega_z_corrected = imu_omega_z_raw - imu_bias
+            dyaw = imu_omega_z_corrected * 0.1 * args.imu_scale
+        else:
+            if not args.use_gt_motion:
+                dyaw = float(pred_motion_phys[3])
+            else:
+                dyaw = gt_dyaw
+                print("Warning: use_gt_motion without use_imu_dyaw; using GT dyaw.")
+
+        # Debug first 3 frames
+        if frame_index == start:
+            print(f"\nDebug first 3 frames:")
+        if frame_index < start + 3:
+            print(f"\nFrame {frame_index}:")
+            if not args.use_gt_motion:
+                print(f"  Raw network (normalized): {pred_motion_norm}")
+                print(f"  Physical (meters/rad):    {pred_motion_phys}")
+            else:
+                print(f"  (Using ground truth motion)")
+            if args.use_imu_dyaw:
+                print(f"  IMU omega_z (raw) = {imu_omega_z_raw:.6f}")
+                print(f"  IMU omega_z (bias-corrected) = {imu_omega_z_corrected:.6f}")
+                print(f"  dyaw (scaled by {args.imu_scale}) = {dyaw:.6f}")
+            print(f"  dx_body = {dx_body:.4f} m, dv = {dv:.4f} m/s")
+            print(f"  GT Δyaw = {gt_dyaw:.6f} rad")
 
         state = ekf.predict(dx_body, dy_body, dv, dyaw)
 
-        use_gnss = should_use_gnss(
-            frame_index,
-            args.gnss_denied_start,
-            args.gnss_denied_len,
-        )
-
+        use_gnss = should_use_gnss(frame_index, args.gnss_denied_start, args.gnss_denied_len)
         if use_gnss:
-            state = ekf.update_gnss(
-                aux["x_next"],
-                aux["y_next"],
-            )
+            state = ekf.update_gnss(aux["x_next"], aux["y_next"])
 
         pred_x = float(state[0])
         pred_y = float(state[1])
-
         gt_x = float(aux["x_next"])
         gt_y = float(aux["y_next"])
 
-        pred_lat, pred_lon = xy_to_latlon(
-            pred_x,
-            pred_y,
-            origin_lat,
-            origin_lon,
-        )
-
+        pred_lat, pred_lon = xy_to_latlon(pred_x, pred_y, origin_lat, origin_lon)
         gt_lat = float(aux["lat_next"])
         gt_lon = float(aux["lon_next"])
 
         predicted_positions.append([pred_x, pred_y])
         ground_truth_positions.append([gt_x, gt_y])
-
         trajectory_rows.append(
             [
                 frame_index,
@@ -288,7 +289,6 @@ def main():
     print("Median ATE [m]:", float(np.median(ate)))
     print("Max ATE [m]:", float(np.max(ate)))
     print("95th Percentile ATE [m]:", float(np.percentile(ate, 95)))
-
     if len(rpe) > 0:
         print("Mean RPE [m]:", float(np.mean(rpe)))
         print("Median RPE [m]:", float(np.median(rpe)))
@@ -297,23 +297,36 @@ def main():
 
     if args.gnss_denied_start >= 0 and args.gnss_denied_len > 0:
         output_dir = Config.eval_dir / "gnss_denied"
-        title = "PINN-EKF localization with GNSS-denied interval"
+        title = f"EKF + IMU localization (scale={args.imu_scale})"
     else:
         output_dir = Config.eval_dir / "normal"
-        title = "PINN-EKF localization with OXTS/GNSS correction"
+        title = "EKF + IMU localization"
 
     output_dir.mkdir(parents=True, exist_ok=True)
-
     plot_trajectory(output_dir, predicted_xy, ground_truth_xy, title)
     plot_ate(output_dir, ate, args.gnss_denied_start, args.gnss_denied_len)
     save_metrics(output_dir, ate, rpe, args.gnss_denied_start, args.gnss_denied_len)
     save_latlon_csv(output_dir, trajectory_rows)
 
     print("\nDONE")
-    print("Output folder:")
-    print(output_dir)
+    print("Output folder:", output_dir)
+
+    # IMU debug
+    print("\n" + "=" * 80)
+    print("DEBUG: First 5 IMU vectors (raw)")
+    print("=" * 80)
+    for i in range(5):
+        sample = dataset[i]
+        imu_raw = sample["imu"].numpy()
+        aux = sample["aux"]
+        gt_dyaw = aux["yaw_next"] - aux["yaw_now"]
+        print(f"Frame {i}: IMU = {imu_raw}")
+        print(f"        omega_z = {imu_raw[5]:.6f}")
+        print(f"        omega_z * 0.1 = {imu_raw[5] * 0.1:.6f}")
+        print(f"        GT Δyaw = {gt_dyaw:.6f}")
+        print("-" * 40)
+    print("=" * 80 + "\n")
 
 
 if __name__ == "__main__":
     main()
-
