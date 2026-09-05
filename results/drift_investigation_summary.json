@@ -1,0 +1,76 @@
+{
+  "canonical_checkpoint": {
+    "path": "artifacts/canonical_epoch3/best_model.pth",
+    "sha256": "ff210612469f6731dde7e5740aa84e91419a1470acc7a30585132a8aa4fd5f06",
+    "selected_epoch": 3,
+    "validation_recursive_ate_rmse_m": 6.914496346411183,
+    "decision": "RETAIN AS CANONICAL MODEL"
+  },
+  "drift_decomposition": {
+    "2011_09_26_drive_0022_sync": {
+      "full_system_ate_m": 6.232,
+      "imu_yaw_only_ate_m": 1.076,
+      "translation_only_ate_m": 6.296
+    },
+    "2011_09_26_drive_0079_sync": {
+      "full_system_ate_m": 3.338,
+      "imu_yaw_only_ate_m": 0.037,
+      "translation_only_ate_m": 3.335
+    },
+    "2011_09_30_drive_0034_sync": {
+      "full_system_ate_m": 7.526,
+      "imu_yaw_only_ate_m": 2.234,
+      "translation_only_ate_m": 8.162
+    }
+  },
+  "signed_translation_bias_cm_per_frame": {
+    "2011_09_26_drive_0022_sync": {
+      "dx": 3.403,
+      "dy": 0.736
+    },
+    "2011_09_26_drive_0079_sync": {
+      "dx": 5.813,
+      "dy": 0.28
+    },
+    "2011_09_30_drive_0034_sync": {
+      "dx": -1.16,
+      "dy": 0.115
+    }
+  },
+  "improvement_experiments": [
+    {
+      "experiment": "sequence_finetune_batchnorm_frozen_probe",
+      "validation_ate_m": 9.9232,
+      "outcome": "worse"
+    },
+    {
+      "experiment": "longitudinal_bias_full_network_probe",
+      "validation_ate_m": 16.030401,
+      "outcome": "worse"
+    },
+    {
+      "experiment": "aggregated_gradient_bias_probe",
+      "validation_ate_m": 9.712741,
+      "outcome": "worse"
+    },
+    {
+      "experiment": "output_layer_only_calibration",
+      "validation_ate_m": 10.596324,
+      "outcome": "worse"
+    },
+    {
+      "experiment": "temporal_residual_head",
+      "best_observed_validation_ate_m": 9.2392,
+      "outcome": "worse"
+    },
+    {
+      "experiment": "stateful_temporal_residual_tbptt",
+      "best_observed_validation_ate_m": 10.3519,
+      "outcome": "worse"
+    }
+  ],
+  "scientific_conclusion": "Recursive drift is dominated primarily by systematic translation error, especially longitudinal dx bias. The bias is drive- and motion-dependent and does not admit a reliable global correction. Tested sequence regularization, full-network fine-tuning, output-only calibration, temporal residual correction, and stateful TBPTT did not outperform the frozen cross-drive validation baseline. The frozen canonical checkpoint is therefore retained.",
+  "model_architecture_changed": false,
+  "canonical_model_after_investigation": "SensorFusionMotionModel",
+  "status": "DRIFT INVESTIGATION CLOSED — RETAIN FROZEN BASELINE"
+}

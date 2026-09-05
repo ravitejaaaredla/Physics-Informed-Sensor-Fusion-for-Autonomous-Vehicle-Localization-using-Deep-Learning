@@ -1,0 +1,7 @@
+PHYSICS VERIFICATION
+====================
+
+Pairs checked: 1511
+Mean reconstruction error [m]: 2.319143566972e-08
+Max reconstruction error [m]: 8.896038854622e-08
+Raw gyro yaw MAE [deg]: 0.013084749

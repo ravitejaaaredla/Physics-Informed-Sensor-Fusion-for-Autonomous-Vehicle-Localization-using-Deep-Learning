@@ -1,0 +1,24 @@
+{
+  "canonical_model": "SensorFusionMotionModel",
+  "model_source": "src/models/sensor_fusion.py",
+  "checkpoint": "artifacts/canonical_epoch3/best_model.pth",
+  "checkpoint_sha256": "ff210612469f6731dde7e5740aa84e91419a1470acc7a30585132a8aa4fd5f06",
+  "selected_epoch": 3,
+  "checkpoint_selection": "validation recursive ATE RMSE",
+  "validation": {
+    "pairs": 2121,
+    "recursive_ate_rmse_m": 6.914496346411183,
+    "local_translation_rmse_m": 0.0944800359805078
+  },
+  "final_test": {
+    "pairs": 2197,
+    "recursive_ate_rmse_m": 15.215576368891963,
+    "local_translation_rmse_m": 0.1216503469842605,
+    "total_gt_distance_m": 2158.607774671475,
+    "total_pred_distance_m": 2221.9764369304517,
+    "pred_gt_distance_ratio": 1.029356265182831
+  },
+  "drift_investigation": "closed",
+  "canonical_model_changed_after_final_test": false,
+  "status": "FINAL RESULTS PACKAGE \u2014 CANONICAL FROZEN MODEL"
+}

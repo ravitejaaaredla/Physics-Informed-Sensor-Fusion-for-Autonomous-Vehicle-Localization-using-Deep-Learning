@@ -1,0 +1,28 @@
+{
+  "checkpoint": "artifacts/canonical_epoch3/best_model.pth",
+  "sha256": "ff210612469f6731dde7e5740aa84e91419a1470acc7a30585132a8aa4fd5f06",
+  "selected_epoch": 3,
+  "best_validation_recursive_ate_rmse_m": 6.914496346411183,
+  "checkpoint_selection_metric": "validation recursive ATE RMSE",
+  "training_pairs": 19483,
+  "validation_pairs": 2121,
+  "diagnostic_0018_pairs": 269,
+  "final_test_pairs": 2197,
+  "drive0018_used_for_training": false,
+  "drive0018_used_for_model_selection": false,
+  "final_test_used_for_training": false,
+  "final_test_used_for_model_selection": false,
+  "model_inputs": [
+    "camera_t",
+    "camera_t1",
+    "lidar_t",
+    "lidar_t1",
+    "imu_window"
+  ],
+  "model_output": [
+    "dx_m",
+    "dy_m"
+  ],
+  "recursive_state_rule": "GT latitude/longitude/yaw only at sequence start; subsequent position and yaw propagated recursively from predictions and IMU yaw integration",
+  "status": "FROZEN BEFORE FINAL TEST EVALUATION"
+}

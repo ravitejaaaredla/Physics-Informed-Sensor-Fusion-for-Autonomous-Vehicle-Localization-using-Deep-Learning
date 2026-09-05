@@ -1,8 +1,76 @@
+# KITTI data
 data/
+data.zip
 kitti/
 KITTI Data/
 
-.idea/
+# Python environments
+.venv/
+venv/
+env/
+bin/
+lib/
+include/
+share/
+pyvenv.cfg
+
+# Training runs and caches
+runs/
+
+# Python cache
 __pycache__/
-*.pyc
+*.py[cod]
+.pytest_cache/
+
+# IDE and operating-system files
+.idea/
 .DS_Store
+
+# Local and obsolete dependency exports
+requirements-full-cuda-export.txt
+requirements.txt.backup
+requirements.txty
+project_imports.txt
+
+# Temporary files created during editing
+.!*
+=*
+*.log
+
+# Legacy scripts from the earlier epoch-14 experiment
+/scripts/audit_final_model.py
+/scripts/audit_frozen_results.py
+/scripts/final_project_audit.py
+/apply_imu_preprocessing.py
+/fix_kitti_exact_pairing.py
+/install_gps_free_pipeline.ps1
+
+# Generated results: retain only the canonical thesis evidence
+/results/*
+!/results/new_frame_pair_manifest.csv
+!/results/training_statistics.json
+!/results/final_frozen_checkpoint.json
+!/results/final_test_summary.json
+!/results/final_test_drive_metrics.csv
+!/results/final_test_frame_predictions.csv
+!/results/expanded_validation_drive_metrics.csv
+!/results/validation_drift_decomposition.csv
+!/results/validation_translation_bias_analysis.csv
+!/results/validation_predicted_motion_bias.csv
+!/results/drift_investigation_summary.json
+
+!/results/thesis_package/
+/results/thesis_package/*
+!/results/thesis_package/final_performance_summary.json
+!/results/thesis_package/final_performance_table.csv
+!/results/thesis_package/thesis_results_tables.md
+!/results/thesis_package/figures/
+/results/thesis_package/figures/*
+!/results/thesis_package/figures/PUBLICATION_12_THESIS_FIGURES/
+!/results/thesis_package/figures/PUBLICATION_12_THESIS_FIGURES/**
+
+# Final document results
+!/results/figures/
+!/results/figures/*.png
+!/results/new_drive_level_split.csv
+!/results/physics_verification.txt

@@ -1,0 +1,21 @@
+{
+  "checkpoint_sha256": "ff210612469f6731dde7e5740aa84e91419a1470acc7a30585132a8aa4fd5f06",
+  "checkpoint_epoch": 3,
+  "final_test_drives": [
+    "2011_09_26_drive_0019_sync",
+    "2011_09_26_drive_0046_sync",
+    "2011_09_30_drive_0033_sync"
+  ],
+  "final_test_pairs": 2197,
+  "local_translation_rmse_m": 0.1216503469842605,
+  "step_rmse_m": 0.12115589397577,
+  "recursive_ate_rmse_m": 15.215576368891963,
+  "recursive_ate_mean_m": 12.048807730111319,
+  "recursive_ate_median_m": 10.649150412226582,
+  "recursive_ate_max_m": 41.29117181262339,
+  "total_gt_distance_m": 2158.607774671475,
+  "total_pred_distance_m": 2221.9764369304517,
+  "overall_pred_gt_distance_ratio": 1.029356265182831,
+  "drive0018_loaded": false,
+  "status": "FINAL TEST EVALUATED ONCE AFTER CHECKPOINT FREEZE"
+}
