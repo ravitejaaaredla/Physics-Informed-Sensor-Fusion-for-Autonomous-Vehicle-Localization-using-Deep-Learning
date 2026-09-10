@@ -121,39 +121,6 @@ Install the dependencies:
 python -m pip install --upgrade pip
 pip install -r requirements.txt
 ```
-
-## Verify the canonical checkpoint
-
-Checkpoint path:
-
-```text
-artifacts/canonical_epoch3/best_model.pth
-```
-
-Expected SHA-256:
-
-```text
-ff210612469f6731dde7e5740aa84e91419a1470acc7a30585132a8aa4fd5f06
-```
-
-Windows PowerShell:
-
-```powershell
-(Get-FileHash .\artifacts\canonical_epoch3\best_model.pth -Algorithm SHA256).Hash.ToLower()
-```
-
-Linux or macOS:
-
-```bash
-sha256sum artifacts/canonical_epoch3/best_model.pth
-```
-
-The recorded final-test results can be inspected with:
-
-```bash
-python -m json.tool results/final_test_summary.json
-```
-
 ## Reproducibility note
 
 This thesis release includes the model definition, canonical checkpoint, manifests, predictions, metrics, and final figures. Full retraining additionally requires:
@@ -171,17 +138,6 @@ The raw dataset and dataset-loader module are not included in the present reposi
 - Matched classical baselines and sensor-modality ablations were not completed.
 - The estimated state is limited to planar translation with externally integrated yaw.
 - Loop closure, map matching, uncertainty estimation, and online global correction are not included.
-
-## Citation
-
-```bibtex
-@mastersthesis{aaredla2026sensorfusion,
-  author = {Aaredla, Raviteja Reddy},
-  title  = {Physics-Informed Sensor Fusion for Autonomous Vehicle Localization Using Deep Learning},
-  school = {IU International University of Applied Sciences},
-  year   = {2026}
-}
-```
 
 ## Acknowledgement
 
